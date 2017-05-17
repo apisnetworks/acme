@@ -9,6 +9,8 @@
 
 namespace Kelunik\Acme;
 
+use Amp\Artax\Client;
+use Amp\Artax\Cookie\NullCookieJar;
 use Amp\Artax\Response;
 use Amp\CoroutineResult;
 use Amp\Pause;
@@ -296,69 +298,113 @@ class AcmeService {
         } while (1);
     }
 
-    /**
-     * Requests a new certificate.
-     *
-     * @api
-     * @param string $csr certificate signing request
-     * @return \Amp\Promise resolves to the URI where the certificate will be provided
-     * @throws AcmeException If something went wrong.
-     */
-    public function requestCertificate($csr) {
-        return \Amp\resolve($this->doRequestCertificate($csr));
-    }
+	/**
+	 * Requests a new certificate.
+	 *
+	 * @api
+	 * @param KeyPair $keyPair domain key pair
+	 * @param array   $domains domains to include in the certificate (first will be used as common name)
+	 * @return \Amp\Promise resolves to the URI where the certificate will be provided
+	 * @throws AcmeException If something went wrong.
+	 */
+	public function requestCertificate(KeyPair $keyPair, array $domains)
+	{
+		return \Amp\resolve($this->doRequestCertificate($keyPair, $domains));
+	}
 
-    /**
-     * Requests a new certificate.
-     *
-     * @param string $csr certificate signing request
-     * @return \Generator coroutine resolved by Amp returning the URI where the certificate will be provided
-     * @throws AcmeException If something went wrong.
-     */
-    private function doRequestCertificate($csr) {
-        if (!is_string($csr)) {
-            throw new \InvalidArgumentException(sprintf("\$csr must be of type bool, %s given", gettype($csr)));
-        }
 
-        $begin = "REQUEST-----";
-        $end = "----END";
+	/**
+	 * Requests a new certificate.
+	 *
+	 * @param KeyPair $keyPair domain key pair
+	 * @param array   $domains domains to include in the certificate (first will be used as common name)
+	 * @return \Generator coroutine resolved by Amp returning the URI where the certificate will be provided
+	 * @throws AcmeException If something went wrong.
+	 */
+	private function doRequestCertificate(KeyPair $keyPair, array $domains)
+	{
+		if (empty($domains)) {
+			throw new AcmeException("Parameter \$domains must not be empty.");
+		}
 
-        $beginPos = strpos($csr, $begin) + strlen($begin);
+		if (!$privateKey = openssl_pkey_get_private($keyPair->getPrivate())) {
+			// TODO: Improve error message
+			throw new AcmeException("Couldn't use private key.");
+		}
 
-        if ($beginPos === false) {
-            throw new InvalidArgumentException("Invalid CSR, maybe not in PEM format?\n{$csr}");
-        }
+		$tempFile = tempnam(sys_get_temp_dir(), "acme_openssl_config_");
+		$tempConf = <<<EOL
+[ req ]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
 
-        $csr = substr($csr, $beginPos);
+[ req_distinguished_name ]
 
-        $endPos = strpos($csr, $end);
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName = @san
 
-        if ($endPos === false) {
-            throw new InvalidArgumentException("Invalid CSR, maybe not in PEM format?\n{$csr}");
-        }
+[ san ]
+EOL;
 
-        $csr = substr($csr, 0, $endPos);
+		$i = 0;
 
-        $enc = new Base64UrlSafeEncoder;
+		$san = implode("\n", array_map(function ($dns) use (&$i) {
+			$i++;
 
-        /** @var Response $response */
-        $response = (yield $this->acmeClient->post(AcmeResource::NEW_CERTIFICATE, [
-            "csr" => $enc->encode(base64_decode($csr)),
-        ]));
+			return "DNS.{$i} = {$dns}";
+		}, $domains));
 
-        if ($response->getStatus() === 201) {
-            if (!$response->hasHeader("location")) {
-                throw new AcmeException("Protocol Violation: No Location Header");
-            }
+		yield \Amp\File\put($tempFile, $tempConf . "\n" . $san . "\n");
 
-            yield new CoroutineResult(current($response->getHeader("location")));
-            return;
-        }
+		$csr = openssl_csr_new([
+			"CN" => reset($domains),
+			"ST" => "Germany",
+			"C"  => "DE",
+			"O"  => "Unknown",
+		], $privateKey, [
+			"digest_alg"     => "sha256",
+			"req_extensions" => "v3_req",
+			"config"         => $tempFile,
+		]);
 
-        throw $this->generateException($response);
-    }
+		yield \Amp\File\unlink($tempFile);
 
-    /**
+		if (!$csr) {
+			// TODO: Improve error message
+			throw new AcmeException("CSR could not be generated.");
+		}
+
+		openssl_csr_export($csr, $csr);
+
+		$begin = "REQUEST-----";
+		$end = "----END";
+
+		$csr = substr($csr, strpos($csr, $begin) + strlen($begin));
+		$csr = substr($csr, 0, strpos($csr, $end));
+
+		$enc = new Base64UrlSafeEncoder;
+
+		/** @var Response $response */
+		$response = (yield $this->acmeClient->post(AcmeResource::NEW_CERTIFICATE, [
+			"csr" => $enc->encode(base64_decode($csr)),
+		]));
+
+		if ($response->getStatus() === 201) {
+			if (!$response->hasHeader("location")) {
+				throw new AcmeException("Protocol Violation: No Location Header");
+			}
+
+			yield new CoroutineResult(current($response->getHeader("location")));
+			return;
+		}
+
+		throw $this->generateException($response);
+	}
+
+
+	/**
      * Polls for a certificate.
      *
      * @api
@@ -505,7 +551,106 @@ class AcmeService {
         return max($time - time(), 0);
     }
 
-    /**
+
+	/**
+	 * Generates the payload which must be provided in HTTP-01 challenges.
+	 *
+	 * @api
+	 * @param KeyPair $accountKeyPair account key pair
+	 * @param string  $token          challenge token
+	 * @return string payload to be provided at /.well-known/acme-challenge/$token
+	 * @throws AcmeException If something went wrong.
+	 */
+	public function generateHttp01Payload(KeyPair $accountKeyPair, $token)
+	{
+		if (!is_string($token)) {
+			throw new InvalidArgumentException(sprintf("\$token must be of type string, %s given.", gettype($token)));
+		}
+
+		if (!$privateKey = openssl_pkey_get_private($accountKeyPair->getPrivate())) {
+			throw new AcmeException("Couldn't read private key.");
+		}
+
+		if (!$details = openssl_pkey_get_details($privateKey)) {
+			throw new AcmeException("Couldn't get private key details.");
+		}
+
+		if ($details["type"] !== OPENSSL_KEYTYPE_RSA) {
+			throw new AcmeException("Key type not supported, only RSA supported currently.");
+		}
+
+		$enc = new Base64UrlSafeEncoder;
+
+		$payload = [
+			"e"   => $enc->encode($details["rsa"]["e"]),
+			"kty" => "RSA",
+			"n"   => $enc->encode($details["rsa"]["n"]),
+		];
+
+		return $token . "." . $enc->encode(hash("sha256", json_encode($payload), true));
+	}
+
+	/**
+	 * Verifies a HTTP-01 challenge.
+	 *
+	 * Can be used to verify a challenge before requesting validation from a CA to catch errors early.
+	 *
+	 * @api
+	 * @param string $domain  domain to verify
+	 * @param string $token   challenge token
+	 * @param string $payload expected payload
+	 * @return \Amp\Promise resolves to null
+	 * @throws AcmeException If the challenge could not be verified.
+	 */
+	public function verifyHttp01Challenge($domain, $token, $payload)
+	{
+		return \Amp\resolve($this->doVerifyHttp01Challenge($domain, $token, $payload));
+	}
+
+	/**
+	 * Verifies a HTTP-01 challenge.
+	 *
+	 * Can be used to verify a challenge before requesting validation from a CA to catch errors early.
+	 *
+	 * @param string $domain  domain to verify
+	 * @param string $token   challenge token
+	 * @param string $payload expected payload
+	 * @return \Generator coroutine resolved by Amp returning null
+	 * @throws AcmeException If the challenge could not be verified.
+	 */
+	private function doVerifyHttp01Challenge($domain, $token, $payload)
+	{
+		if (!is_string($domain)) {
+			throw new InvalidArgumentException(sprintf("\$domain must be of type string, %s given.", gettype($domain)));
+		}
+
+		if (!is_string($token)) {
+			throw new InvalidArgumentException(sprintf("\$token must be of type string, %s given.", gettype($token)));
+		}
+
+		if (!is_string($payload)) {
+			throw new InvalidArgumentException(sprintf("\$payload must be of type string, %s given.",
+				gettype($payload)));
+		}
+
+		$uri = "http://{$domain}/.well-known/acme-challenge/{$token}";
+
+		$client = new Client(new NullCookieJar);
+
+		/** @var Response $response */
+		$response = (yield $client->request($uri, [
+			Client::OP_CRYPTO => [
+				"verify_peer"      => false,
+				"verify_peer_name" => false,
+			],
+		]));
+
+		if (rtrim($payload) !== rtrim($response->getBody())) {
+			throw new AcmeException("selfVerify failed, please check {$uri}.");
+		}
+	}
+
+	/**
      * Generates a new exception using the response to provide details.
      *
      * @param Response $response HTTP response to generate the exception from
